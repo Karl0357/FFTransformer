@@ -17,6 +17,8 @@ class Model(nn.Module):
     """
     def __init__(self, configs):
         super(Model, self).__init__()
+        self.num_quantiles = configs.num_quantiles  # New parameter
+
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
 
@@ -70,7 +72,9 @@ class Model(nn.Module):
             ],
             mlp_out=MLPLayer(d_model=configs.d_model, d_ff=configs.d_ff, kernel_size=1,
                              dropout=configs.dropout, activation=configs.activation) if configs.mlp_out else None,
-            projection=nn.Linear(configs.d_model, configs.c_out, bias=True)
+            # Modify the final output layer to produce multiple outputs
+            projection = nn.Linear(configs.d_model, configs.c_out * self.num_quantiles, bias=True)
+            #projection=nn.Linear(configs.d_model, configs.c_out, bias=True)
         )
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, enc_self_mask=None, **_):
@@ -107,4 +111,6 @@ class Model(nn.Module):
         if self.output_attention:
             return outputs.nodes[:, -self.pred_len:, :], attns
         else:
-            return outputs.nodes[:, -self.pred_len:, :]  # [B, L, D]
+            output = outputs.nodes[:, -self.pred_len:, :]
+            return output.view(output.size(0), output.size(1), configs.c_out, configs.num_quantiles) # [B, L, D, Q]
+            #return outputs.nodes[:, -self.pred_len:, :]  # [B, L, D]

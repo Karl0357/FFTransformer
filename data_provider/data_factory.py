@@ -1,7 +1,6 @@
 from torch.utils.data import DataLoader
 from data_provider.data_loader import Dataset_wind_data, Dataset_wind_data_graph, collate_graph
 
-
 data_dict = {
     'Wind': Dataset_wind_data,
     'WindGraph': Dataset_wind_data_graph

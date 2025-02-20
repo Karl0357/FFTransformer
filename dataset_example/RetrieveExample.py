@@ -20,7 +20,7 @@ from math import sin, cos, sqrt, atan2, radians, atan, tan
 
 
 # Insert your own client ID here
-client_id = ''
+client_id = '95dff942-392f-45d5-9b3c-3364db30c5cf'
 
 
 # Get accurate distance between turbines, accounting for the fact that the earth is elliptical.
@@ -249,18 +249,18 @@ if __name__ == '__main__':
     # Get stations inside "polygon" in sorted order of which are closest to "coord_main"
     stations = get_stations(coord_main, polygon)
 
-    # Select the closest stations to coord_main for example: 
-    stations = stations.iloc[:2]
+    # # Select the closest stations to coord_main for example: 
+    # stations = stations.iloc[:2]
 
-    # Specify some elements you want to inspect, see https://frost.met.no/api.html#/ for which are available: 
-    elements_list = ['wind_speed',
-                     'wind_from_direction',
-                     'air_pressure_at_sea_level',
-                     'air_temperature',]
+    # # Specify some elements you want to inspect, see https://frost.met.no/api.html#/ for which are available: 
+    # elements_list = ['wind_speed',
+    #                  'wind_from_direction',
+    #                  'air_pressure_at_sea_level',
+    #                  'air_temperature',]
     
-    # Get the period for which the stations have the elements available and at what resolution
-    # This function might fail if a specified stations doesnt have any available data for the 
-    # specified elements (just a trivial example).
-    stations, elements_list = get_info(stations, elements_list)
+    # # Get the period for which the stations have the elements available and at what resolution
+    # # This function might fail if a specified stations doesnt have any available data for the 
+    # # specified elements (just a trivial example).
+    # stations, elements_list = get_info(stations, elements_list)
 
-    get_timeseries(stations, save_path='RawData')
+    # get_timeseries(stations, save_path='RawData')

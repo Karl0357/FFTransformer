@@ -180,8 +180,8 @@ class Dataset_wind_data_graph(Dataset):
         self.total_seq_len = self.seq_len + self.pred_len
         assert self.label_len <= self.seq_len
         # init
-        assert flag in ['train', 'test', 'val']
-        type_map = {'train': 0, 'val': 1, 'test': 2}
+        assert flag in ['train', 'test', 'val', 'calib']
+        type_map = {'train': 0, 'val': 1, 'test': 2, 'calib':3}
         self.set_type = type_map[flag]
         self.flag = flag
 
@@ -226,7 +226,6 @@ class Dataset_wind_data_graph(Dataset):
         # Get the indices for the different stations
         self._stations = {s: i for i, s in enumerate(df_raw.columns.get_level_values(1).unique())}
         self._stations_inv = {v: k for k, v in self._stations.items()}
-
         # Load the static edge features:
         edge_feats = pd.read_csv(os.path.join(self.root_path, 'edge_feats.csv').replace('\\', '/'),
                                  header=[0, 1], index_col=0)

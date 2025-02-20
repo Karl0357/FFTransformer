@@ -3,7 +3,7 @@ import torch
 from exp.exp_main import Exp_Main
 import random
 import numpy as np
-
+from typing import Literal
 
 def main():
     fix_seed = 2022
@@ -16,7 +16,7 @@ def main():
     # basic config
     parser.add_argument('--is_training', type=int, required=False, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=False, default='test', help='model id for saving')
-    parser.add_argument('--model', type=str, required=False, default='FFTransformer',
+    parser.add_argument('--model', type=str, required=False, default='GraphFFTransformer',
                         help='model name, options: [FFTransformer, Autoformer, Informer, Transformer, LogSparse, LSTM, MLP, persistence (and same with GraphXxxx)]')
     parser.add_argument('--plot_flag', type=int, default=1, help='Whether to save loss plots or not')
     parser.add_argument('--test_dir', type=str, default='', help='Base dir to save test results')
@@ -73,15 +73,16 @@ def main():
     # Optimization
     parser.add_argument('--num_workers', type=int, default=0, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')
-    parser.add_argument('--train_epochs', type=int, default=10, help='train epochs')
+    parser.add_argument('--train_epochs', type=int, default=1, help='train epochs') # changed it to 1
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--patience', type=int, default=5, help='early stopping patience')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='optimizer learning rate')
     parser.add_argument('--lr_decay_rate', type=float, default=0.8, help='Rate for which to decay lr with')
     parser.add_argument('--des', type=str, default='test', help='exp description')
-    parser.add_argument('--loss', type=str, default='mse', help='loss function')
+    # parser.add_argument('--loss', type=str, default='mse', help='loss function')
     parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
-
+    parser.add_argument('--loss', type=str, default='mse', help='Loss function. Use "quantile" for quantile loss')
+    parser.add_argument('--quantiles', type=str, default='0.1,0.5,0.9', help='Comma-separated list of quantiles for quantile loss')
     # GPU
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
     parser.add_argument('--gpu', type=int, default=0, help='gpu')
@@ -90,7 +91,6 @@ def main():
     parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multiple gpus')
 
     args = parser.parse_args()
-
     if args.features == 'S':
         assert (np.array([args.c_out, args.enc_in, args.dec_in]) == 1).all(), "c_out, enc_in and dec_in should be 1 for univariate"
 
@@ -102,6 +102,19 @@ def main():
         args.device_ids = [int(id_) for id_ in device_ids]
         args.gpu = args.device_ids[0]
 
+    if args.loss == 'quantile':
+        quantiles = [float(q) for q in args.quantiles.split(',')]
+        for q in quantiles:
+            if not 0 < q < 1:
+                raise ValueError(f"Quantile value must be between 0 and 1, got {q}")
+        args.num_quantiles = len(quantiles)
+        print(f"Performing quantile regression with quantiles: {quantiles}")
+    elif args.loss == 'mse':
+        args.num_quantiles = 1
+        print("Performing point prediction with MSE loss")
+    else:
+        raise ValueError(f"Unsupported loss function: {args.loss}")
+
     print('Args in experiment:')
     print(args)
 
@@ -110,19 +123,41 @@ def main():
     if args.is_training:
         for ii in range(args.itr):
             # setting record of experiments
-            setting = '{}_{}_{}_ft{}_sl{}_ll{}_pl{}_{}'.format(
-                args.model_id,
-                args.model,
-                args.data,
-                args.features,
-                args.seq_len,
-                args.label_len,
-                args.pred_len,
-                ii)
+            if args.loss == 'quantile':
+                setting = '{}_{}_{}_ft{}_sl{}_ll{}_pl{}_q{}_{}'.format(
+                    args.model_id,
+                    args.model,
+                    args.data,
+                    args.features,
+                    args.seq_len,
+                    args.label_len,
+                    args.pred_len,
+                    args.quantiles.replace(',', '-'),  # Replace commas with hyphens for filename compatibility
+                    ii
+                )
+            else:
+                setting = '{}_{}_{}_ft{}_sl{}_ll{}_pl{}_{}'.format(
+                    args.model_id,
+                    args.model,
+                    args.data,
+                    args.features,
+                    args.seq_len,
+                    args.label_len,
+                    args.pred_len,
+                    ii
+                )
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
+
+            # After training, calibrate the quantiles
+            # args.quantiles is not an empty string
+            if args.loss == 'quantile':
+                qhat = exp.calibrate_quantiles(setting)
+                
+                # Save qhat for later use
+                torch.save({'qhat': qhat}, f'./checkpoints/{setting}/qhat.pth')
 
             print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
             exp.test(setting, base_dir=args.test_dir)

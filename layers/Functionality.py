@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pytorch_forecasting.metrics import QuantileLoss as PFQuantileLoss
 
 
 class MLPLayer(nn.Module):
@@ -52,3 +53,23 @@ class ConvLayer(nn.Module):
         x = self.maxPool(x)
         x = x.transpose(1, 2)
         return x
+
+class MultiQuantileLoss(nn.Module):
+    def __init__(self, quantiles):
+        super().__init__()
+        self.quantiles = quantiles
+        
+    def forward(self, preds, target):
+        assert not target.requires_grad
+        assert preds.size(0) == target.size(0)
+        losses = []
+        
+        for i, q in enumerate(self.quantiles):
+            errors = target - preds[:, :, :, i]
+            losses.append(torch.max((q-1) * errors, q * errors).unsqueeze(-1))
+        
+        loss = torch.mean(torch.cat(losses, dim=-1))
+        return loss
+
+    def __repr__(self):
+        return f"MultiQuantileLoss(quantiles={self.quantiles})"

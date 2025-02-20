@@ -8,6 +8,7 @@ from utils.tools import EarlyStopping, adjust_learning_rate, visual, PlotLossesS
 from utils.metrics import metric
 from utils.graph_utils import data_dicts_to_graphs_tuple, split_torch_graph
 from utils.CustomDataParallel import DataParallelGraph
+from layers.Functionality import MultiQuantileLoss
 
 import pickle
 import torch
@@ -29,7 +30,9 @@ class Exp_Main(Exp_Basic):
         super(Exp_Main, self).__init__(args)
         if self.args.data == 'WindGraph':
             self.args.seq_len = self.args.label_len
-
+        if self.args.quantiles is not None:
+            self.args.quantiles = [float(q) for q in self.args.quantiles.split(',')]
+            self.args.quantiles.sort() # acecending order
     def _build_model(self):
         model_dict = {
             'Autoformer': Autoformer,
@@ -68,13 +71,94 @@ class Exp_Main(Exp_Basic):
         return model_optim
 
     def _select_criterion(self):
-        criterion = nn.MSELoss()
+        if self.args.loss == 'quantile':
+            quantiles = [float(q) for q in self.args.quantiles.split(',')]
+            for q in quantiles:
+                assert 0 < q < 1, f"Quantile value must be between 0 and 1, got {q}"
+            criterion = MultiQuantileLoss(quantiles)
+        else:
+            criterion = nn.MSELoss()
         return criterion
-
+    
     def MAPE(self, pred, tar, eps=1e-07):
         loss = torch.mean(torch.abs(pred - tar) / (tar + eps))
         return loss
+    
+    def calibrate_quantiles(self, setting):
+        self.model.eval()
+        
+        calib_data, calib_loader = self._get_data(flag='calib')
+        
+        preds = []
+        trues = []
+        
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(calib_loader):
+                # Prepare inputs (similar to test method)
+                if self.args.data == 'WindGraph':
+                    batch_x = data_dicts_to_graphs_tuple(batch_x, device=self.device)
+                    batch_y = data_dicts_to_graphs_tuple(batch_y, device=self.device)
+                    dec_inp = batch_y
+                    
+                    batch_x_mark = batch_x_mark.float().to(self.device)
+                    batch_y_mark = batch_y_mark.float().to(self.device)
+                    
+                    # decoder input
+                    dec_zeros = dec_inp.nodes[:, (self.args.label_len - 1):self.args.label_len, :]
+                    dec_zeros = dec_zeros.repeat(1, self.args.pred_len, 1).float()
+                    dec_zeros = torch.cat([dec_inp.nodes[:, :self.args.label_len, :], dec_zeros], dim=1)
+                    dec_zeros = dec_zeros.float().to(self.device)
+                    dec_inp = dec_inp.replace(nodes=dec_zeros)
+                    
+                    dec_inp = dec_inp.replace(nodes=dec_inp.nodes[:, :, -self.args.dec_in:])
+                    batch_x = batch_x.replace(nodes=batch_x.nodes[:, :, -self.args.enc_in:])
 
+                # Get model predictions
+                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                
+                if 'M' in self.args.features:
+                    f_dim = -self.args.c_out
+                else:
+                    f_dim = 0
+                
+                outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                
+                if self.args.data == 'WindGraph':
+                    batch_y = batch_y.nodes[:, -self.args.pred_len:, f_dim:].to(self.device)
+                else:
+                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                
+                outputs = outputs.view(outputs.size(0), outputs.size(1), self.args.c_out, -1)
+                
+                pred = outputs.detach().cpu().numpy()
+                true = batch_y.detach().cpu().numpy()
+                
+                preds.append(pred)
+                trues.append(true)
+        
+        preds = np.vstack(preds)
+        trues = np.vstack(trues)
+        
+        # Assuming preds has shape (samples, pred_len, num_quantiles)
+        lower_idx, upper_idx = 0, -1  # Adjust these based on your quantile indices
+        
+        cal_lower = preds[:, :, lower_idx]
+        cal_upper = preds[:, :, upper_idx]
+        
+        # Compute calibration scores
+        cal_scores = np.maximum(trues - cal_upper, cal_lower - trues)
+        
+        # Compute the conformity score
+        n = len(cal_scores)
+        alpha = 1 - (self.args.quantiles[0] - self.args.quantiles[-1])
+        qhat = np.quantile(cal_scores, np.ceil((n+1)*(1-alpha))/n, interpolation='higher')
+        
+        # Correct the quantiles
+        # corrected_lower = cal_lower - qhat
+        # corrected_upper = cal_upper + qhat
+        
+        return qhat
+    
     def vali(self, setting, vali_data, vali_loader, criterion, epoch=0, plot_res=1, save_path=None):
         total_loss = []
         total_mse = []
@@ -101,24 +185,6 @@ class Exp_Main(Exp_Basic):
 
                     dec_inp = dec_inp.replace(nodes=dec_inp.nodes[:, :, -self.args.dec_in:])
                     batch_x = batch_x.replace(nodes=batch_x.nodes[:, :, -self.args.enc_in:])
-                # Non-Graph Data (i.e. just temporal)
-                else:
-                    dec_inp = batch_y
-
-                    batch_x = batch_x.float().to(self.device)
-                    batch_y = batch_y.float()
-
-                    batch_x_mark = batch_x_mark.float().to(self.device)
-                    batch_y_mark = batch_y_mark.float().to(self.device)
-
-                    # decoder input
-                    dec_zeros = dec_inp[:, (self.args.label_len-1):self.args.label_len, :]         # Select last value
-                    dec_zeros = dec_zeros.repeat(1, self.args.pred_len, 1).float()                 # Repeat for pred_len
-                    dec_inp = torch.cat([dec_inp[:, :self.args.label_len, :], dec_zeros], dim=1)   # Add Placeholders
-                    dec_inp = dec_inp.float().to(self.device)
-
-                    dec_inp = dec_inp[:, :, -self.args.dec_in:]
-                    batch_x = batch_x[:, :, -self.args.enc_in:]
 
                 if self.args.data == 'WindGraph' and self.args.use_multi_gpu:
                     batch_x, sub_bs_x, target_gpus = split_torch_graph(batch_x, self.args.devices.split(','))
@@ -142,6 +208,15 @@ class Exp_Main(Exp_Basic):
                     batch_y = batch_y.nodes[:, -self.args.pred_len:, f_dim:].to(self.device)
                 else:
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+
+                # Reshape outputs for quantile regression if necessary
+                if self.args.loss == 'quantile':
+                    outputs = outputs.view(outputs.size(0), outputs.size(1), self.args.c_out, -1)
+                    # Assuming median is the middle quantile
+                    median_index = len(self.args.quantiles.split(',')) // 2
+                    outputs = outputs[:, :, :, median_index]
+                else:
+                    outputs = outputs.squeeze(-1)  # Remove last dimension for point prediction
 
                 pred = outputs.detach().cpu()
                 true = batch_y.detach().cpu()
@@ -278,6 +353,12 @@ class Exp_Main(Exp_Basic):
                 else:
                     outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark,
                                          teacher_forcing_ratio=teacher_forcing_ratio, batch_y=batch_y)
+                
+                # Reshape outputs for quantile regression if necessary
+                if self.args.loss == 'quantile':
+                    outputs = outputs.view(outputs.size(0), outputs.size(1), self.args.c_out, -1)
+                else:
+                    outputs = outputs.squeeze(-1)  # Remove last dimension for point prediction
 
                 if 'M' in self.args.features:
                     f_dim = -self.args.c_out
@@ -400,6 +481,12 @@ class Exp_Main(Exp_Basic):
                                               ignore_paths=ignore_paths)
             if os.path.exists(load_path) and load_check_flag:
                 self.model.load_state_dict(torch.load(load_path))
+                # Extract quantile from setting string if present
+                setting_parts = setting.split('_')
+                if 'q' in setting_parts:
+                    q_index = setting_parts.index('q')
+                    if q_index + 1 < len(setting_parts):
+                        self.args.quantile = float(setting_parts[q_index + 1])
             else:
                 print('Could not load best model')
 
@@ -418,6 +505,11 @@ class Exp_Main(Exp_Basic):
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
                 if self.args.data == 'WindGraph':
+                    if i == 1:
+                        print('batch_x:', batch_x)
+                        print('batch_y:', batch_y)
+                        print('batch_x_mark:', batch_x_mark)
+                        print('batch_y_mark:', batch_y_mark)
                     batch_x = data_dicts_to_graphs_tuple(batch_x, device=self.device)
                     batch_y = data_dicts_to_graphs_tuple(batch_y, device=self.device)
                     dec_inp = batch_y
@@ -475,6 +567,11 @@ class Exp_Main(Exp_Basic):
                     batch_y = batch_y.nodes[:, -self.args.pred_len:, f_dim:].to(self.device)
                 else:
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                
+                if self.args.loss == 'quantile':
+                    outputs = outputs.view(outputs.size(0), outputs.size(1), self.args.c_out, -1)
+                else:
+                    outputs = outputs.squeeze(-1)  # Remove last dimension for point prediction
 
                 outputs = outputs.detach().cpu().numpy()
                 batch_y = batch_y.detach().cpu().numpy()
@@ -496,92 +593,110 @@ class Exp_Main(Exp_Basic):
                     pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
                     if save_flag:
                         visual(gt, pd, os.path.join(folder_path, str(i) + '.png'))
-
         preds = np.vstack(preds)
         trues = np.vstack(trues)
         if self.args.data == 'WindGraph':
             station_ids = np.concatenate(station_ids)
 
         print('test shape:', preds.shape, trues.shape)
-        print('test shape:', preds.shape, trues.shape)
 
         # save results
         if save_flag:
-            if len(save_dir) == 0:
-                folder_path = './results/' + setting + '/'
-            else:
-                folder_path = save_dir + 'results/' + setting + '/'
-            if not os.path.exists(folder_path):
-                os.makedirs(folder_path)
+            folder_path = os.path.join(save_dir, 'results', setting) if save_dir else os.path.join('./results', setting)
+            os.makedirs(folder_path, exist_ok=True)
 
-        mae, mse, rmse, mape, mspe = metric(preds, trues)
+        losses = {}
 
-        preds_un = test_data.inverse_transform(preds)
-        trues_un = test_data.inverse_transform(trues)
-        mae_un, mse_un, rmse_un, mape_un, mspe_un = metric(preds_un, trues_un)
-
-        losses = {
-            'mae_sc': mae,
-            'mse_sc': mse,
-            'rmse_sc': rmse,
-            'mape_sc': mape,
-            'mspe_sc': mspe,
-            '': '\n\n',
-            'mae_un': mae_un,
-            'mse_un': mse_un,
-            'rmse_un': rmse_un,
-            'mape_un': mape_un,
-            'mspe_un': mspe_un,
-        }
+        if self.args.loss == 'quantile':
+            quantiles = [float(q) for q in self.args.quantiles.split(',')]
+            for i, q in enumerate(quantiles):
+                mae, mse, rmse, mape, mspe = metric(preds[..., i], trues)
+                losses.update({
+                    f'mae_q{q}': mae,
+                    f'mse_q{q}': mse,
+                    f'rmse_q{q}': rmse,
+                    f'mape_q{q}': mape,
+                    f'mspe_q{q}': mspe,
+                })
+                
+                # Inverse transform and calculate metrics for un-scaled data
+                preds_un = test_data.inverse_transform(preds[..., i])
+                trues_un = test_data.inverse_transform(trues)
+                mae_un, mse_un, rmse_un, mape_un, mspe_un = metric(preds_un, trues_un)
+                losses.update({
+                    f'mae_un_q{q}': mae_un,
+                    f'mse_un_q{q}': mse_un,
+                    f'rmse_un_q{q}': rmse_un,
+                    f'mape_un_q{q}': mape_un,
+                    f'mspe_un_q{q}': mspe_un,
+                })
+                
+                if save_flag:
+                    np.save(os.path.join(folder_path, f'pred_q{q}.npy'), preds[..., i])
+                    np.save(os.path.join(folder_path, f'pred_un_q{q}.npy'), preds_un)
+        else:
+            mae, mse, rmse, mape, mspe = metric(preds, trues)
+            preds_un = test_data.inverse_transform(preds)
+            trues_un = test_data.inverse_transform(trues)
+            mae_un, mse_un, rmse_un, mape_un, mspe_un = metric(preds_un, trues_un)
+            
+            losses = {
+                'mae_sc': mae, 'mse_sc': mse, 'rmse_sc': rmse, 'mape_sc': mape, 'mspe_sc': mspe,
+                'mae_un': mae_un, 'mse_un': mse_un, 'rmse_un': rmse_un, 'mape_un': mape_un, 'mspe_un': mspe_un,
+            }
+            
+            if save_flag:
+                np.save(os.path.join(folder_path, 'pred.npy'), preds)
+                np.save(os.path.join(folder_path, 'pred_un.npy'), preds_un)
 
         if self.args.data == 'WindGraph':
             for stat in np.unique(station_ids):
                 indxs_i = np.where(station_ids == stat)[0]
+                if self.args.loss == 'quantile':
+                    for i, q in enumerate(quantiles):
+                        mae_i, mse_i, rmse_i, mape_i, mspe_i = metric(preds[indxs_i, ..., i], trues[indxs_i])
+                        preds_un_i = test_data.inverse_transform(preds[indxs_i, ..., i])
+                        trues_un_i = test_data.inverse_transform(trues[indxs_i])
+                        mae_un_i, mse_un_i, rmse_un_i, mape_un_i, mspe_un_i = metric(preds_un_i, trues_un_i)
+                        losses.update({
+                            f'mae_sc_{stat}_q{q}': mae_i, f'mse_sc_{stat}_q{q}': mse_i, 
+                            f'rmse_sc_{stat}_q{q}': rmse_i, f'mape_sc_{stat}_q{q}': mape_i, 
+                            f'mspe_sc_{stat}_q{q}': mspe_i,
+                            f'mae_un_{stat}_q{q}': mae_un_i, f'mse_un_{stat}_q{q}': mse_un_i, 
+                            f'rmse_un_{stat}_q{q}': rmse_un_i, f'mape_un_{stat}_q{q}': mape_un_i, 
+                            f'mspe_un_{stat}_q{q}': mspe_un_i,
+                        })
+                else:
+                    mae_i, mse_i, rmse_i, mape_i, mspe_i = metric(preds[indxs_i], trues[indxs_i])
+                    preds_un_i = test_data.inverse_transform(preds[indxs_i])
+                    trues_un_i = test_data.inverse_transform(trues[indxs_i])
+                    mae_un_i, mse_un_i, rmse_un_i, mape_un_i, mspe_un_i = metric(preds_un_i, trues_un_i)
+                    losses.update({
+                        f'mae_sc_{stat}': mae_i, f'mse_sc_{stat}': mse_i, f'rmse_sc_{stat}': rmse_i, 
+                        f'mape_sc_{stat}': mape_i, f'mspe_sc_{stat}': mspe_i,
+                        f'mae_un_{stat}': mae_un_i, f'mse_un_{stat}': mse_un_i, f'rmse_un_{stat}': rmse_un_i, 
+                        f'mape_un_{stat}': mape_un_i, f'mspe_un_{stat}': mspe_un_i,
+                    })
 
-                mae_i, mse_i, rmse_i, mape_i, mspe_i = metric(preds[indxs_i], trues[indxs_i])
-
-                preds_un_i = test_data.inverse_transform(preds[indxs_i])
-                trues_un_i = test_data.inverse_transform(trues[indxs_i])
-
-                mae_un_i, mse_un_i, rmse_un_i, mape_un_i, mspe_un_i = metric(preds_un_i, trues_un_i)
-
-                losses_i = {
-                    '': '\n\n',
-                    'mae_sc_' + stat: mae_i,
-                    'mse_sc_' + stat: mse_i,
-                    'rmse_sc_' + stat: rmse_i,
-                    'mape_sc_' + stat: mape_i,
-                    'mspe_sc_' + stat: mspe_i,
-                    'mae_un_' + stat: mae_un_i,
-                    'mse_un_' + stat: mse_un_i,
-                    'rmse_un_' + stat: rmse_un_i,
-                    'mape_un_' + stat: mape_un_i,
-                    'mspe_un_' + stat: mspe_un_i,
-                }
-                losses.update(losses_i)
-
-        if not save_flag:
-            return losses
-
-        with open(folder_path + "results_loss.txt", 'w') as f:
-            for key, value in losses.items():
-                f.write('%s:%s\n' % (key, value))
-
-        print('mse:{}, mae:{}'.format(mse, mae))
-
-        np.save(folder_path + 'metrics.npy', np.array([mae, mse, rmse, mape, mspe]))
-        np.save(folder_path + 'pred.npy', preds)
-        np.save(folder_path + 'true.npy', trues)
-        np.save(folder_path + 'pred_un.npy', preds_un)
-        np.save(folder_path + 'true_un.npy', trues_un)
-        if self.args.data == 'WindGraph':
-            np.save(folder_path + 'station_ids.npy', station_ids)
-
-        with open(folder_path + 'metrics.txt', 'w') as f:
-            f.write('mse: ' + str(mse) + '\n')
-            f.write('mae: ' + str(mae) + '\n')
-            f.write('rmse: ' + str(rmse) + '\n')
-            f.write('mape: ' + str(mape) + '\n')
-            f.write('mspe: ' + str(mspe) + '\n')
+        if save_flag:
+            np.save(os.path.join(folder_path, 'true.npy'), trues)
+            np.save(os.path.join(folder_path, 'true_un.npy'), trues_un)
+            if self.args.data == 'WindGraph':
+                np.save(os.path.join(folder_path, 'station_ids.npy'), station_ids)
+            
+            with open(os.path.join(folder_path, "results_loss.txt"), 'w') as f:
+                for key, value in losses.items():
+                    f.write(f'{key}:{value}\n')
+            
+            with open(os.path.join(folder_path, 'metrics.txt'), 'w') as f:
+                if self.args.loss == 'quantile':
+                    for q in quantiles:
+                        f.write(f'Quantile {q}:\n')
+                        for metric in ['mse', 'mae', 'rmse', 'mape', 'mspe']:
+                            f.write(f'{metric}: {losses[f"{metric}_q{q}"]}\n')
+                        f.write('\n')
+                else:
+                    for metric in ['mse', 'mae', 'rmse', 'mape', 'mspe']:
+                        f.write(f'{metric}: {losses[metric + "_sc"]}\n')
 
         return losses
