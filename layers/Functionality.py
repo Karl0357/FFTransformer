@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -73,3 +74,14 @@ class MultiQuantileLoss(nn.Module):
 
     def __repr__(self):
         return f"MultiQuantileLoss(quantiles={self.quantiles})"
+    
+
+def temporal_split(data, calib_size, val_size):
+    total_size = len(data)
+    max_start = total_size - (calib_size + val_size)
+    start = np.random.randint(0, max_start)
+    
+    calib_data = data[start:start+calib_size]
+    val_data = data[start+calib_size:start+calib_size+val_size]
+    
+    return calib_data, val_data

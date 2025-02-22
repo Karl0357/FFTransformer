@@ -20,37 +20,37 @@ def main():
                         help='model name, options: [FFTransformer, Autoformer, Informer, Transformer, LogSparse, LSTM, MLP, persistence (and same with GraphXxxx)]')
     parser.add_argument('--plot_flag', type=int, default=1, help='Whether to save loss plots or not')
     parser.add_argument('--test_dir', type=str, default='', help='Base dir to save test results')
-    parser.add_argument('--verbose', type=int, default=1, help='Whether to print inter-epoch losses.')
+    parser.add_argument('--verbose', type=int, default=2, help='Whether to print inter-epoch losses.')
 
     # data loader
-    parser.add_argument('--data', type=str, required=False, default='Wind', help='dataset type, Wind or WindGraph')
+    parser.add_argument('--data', type=str, required=False, default='WindGraph', help='dataset type, Wind or WindGraph')
     parser.add_argument('--root_path', type=str, default='./dataset_example/WindData/dataset/', help='root path of the data file')
     parser.add_argument('--data_path', type=str, default='wind_data.csv', help='data file')
     parser.add_argument('--target', type=str, default='KVITEBJØRNFELTET', help='optional target station for non-graph models')
-    parser.add_argument('--freq', type=str, default='10min', help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
+    parser.add_argument('--freq', type=str, default='h', help='freq for time features encoding...')
     parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
     parser.add_argument('--checkpoint_flag', type=int, default=1, help='Whether to checkpoint or not')
     parser.add_argument('--n_closest', type=int, default=None, help='number of closest nodes for graph connectivity, None --> complete graph')
     parser.add_argument('--all_stations', type=int, default=0, help='Whether to use all stations or just target for non-spatial models.')
-    parser.add_argument('--data_step', type=int, default=1, help='Only use every nth point. Set data_step = 1 for full dataset.')
+    parser.add_argument('--data_step', type=int, default=10, help='Only use every nth point. Set data_step = 1 for full dataset.')
     parser.add_argument('--min_num_nodes', type=int, default=2, help='Minimum number of nodes in a graph')
 
     # forecasting task
     parser.add_argument('--features', type=str, default='M', help='forecasting task, options:[M, S]; M:multivariate input, S:univariate input')
-    parser.add_argument('--seq_len', type=int, default=64, help='input sequence length')
-    parser.add_argument('--label_len', type=int, default=48, help='start token length. Note that Graph models only use label_len and pred_len')
-    parser.add_argument('--pred_len', type=int, default=6, help='prediction sequence length')
-    parser.add_argument('--enc_in', type=int, default=8, help='Number of encoder input features')
-    parser.add_argument('--dec_in', type=int, default=8, help='Number of decoder input features')
+    parser.add_argument('--seq_len', type=int, default=8, help='input sequence length')
+    parser.add_argument('--label_len', type=int, default=4, help='start token length. Note that Graph models only use label_len and pred_len')
+    parser.add_argument('--pred_len', type=int, default=2, help='prediction sequence length')
+    parser.add_argument('--enc_in', type=int, default=7, help='Number of encoder input features')
+    parser.add_argument('--dec_in', type=int, default=7, help='Number of decoder input features')
     parser.add_argument('--c_out', type=int, default=1, help='output size, note that it is assumed that the target features are placed last')
 
     # model define
-    parser.add_argument('--d_model', type=int, default=512, help='dimension of model')
-    parser.add_argument('--n_heads', type=int, default=8, help='num of heads')
-    parser.add_argument('--e_layers', type=int, default=2, help='number of encoder layers for non-spatial and number of LSTM or MLP layers for GraphLSTM and GraphMLP')
+    parser.add_argument('--d_model', type=int, default=32, help='dimension of model')
+    parser.add_argument('--n_heads', type=int, default=1, help='num of heads')
+    parser.add_argument('--e_layers', type=int, default=1, help='number of encoder layers for non-spatial and number of LSTM or MLP layers for GraphLSTM and GraphMLP')
     parser.add_argument('--d_layers', type=int, default=1, help='num of decoder layers')
-    parser.add_argument('--gnn_layers', type=int, default=2, help='Number of sequential graph blocks in GNN')
-    parser.add_argument('--d_ff', type=int, default=2048, help='dimension of fcn')
+    parser.add_argument('--gnn_layers', type=int, default=1, help='Number of sequential graph blocks in GNN')
+    parser.add_argument('--d_ff', type=int, default=32, help='dimension of fcn')
     parser.add_argument('--moving_avg', type=int, default=25, help='window size of moving average for Autoformer')
     parser.add_argument('--factor', type=int, default=3, help='attn factor')
     parser.add_argument('--distil', action='store_false', default=True, help='whether to use distilling in encoder, using this argument means not using distilling, not used for GNN models')
@@ -74,7 +74,7 @@ def main():
     parser.add_argument('--num_workers', type=int, default=0, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')
     parser.add_argument('--train_epochs', type=int, default=1, help='train epochs') # changed it to 1
-    parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
+    parser.add_argument('--batch_size', type=int, default=2, help='batch size of train input data')
     parser.add_argument('--patience', type=int, default=5, help='early stopping patience')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='optimizer learning rate')
     parser.add_argument('--lr_decay_rate', type=float, default=0.8, help='Rate for which to decay lr with')
@@ -155,9 +155,13 @@ def main():
             # args.quantiles is not an empty string
             if args.loss == 'quantile':
                 qhat = exp.calibrate_quantiles(setting)
+                print(f"Calibrated quantiles is to be adjusted by qhat: {qhat}")
                 
                 # Save qhat for later use
                 torch.save({'qhat': qhat}, f'./checkpoints/{setting}/qhat.pth')
+
+                # calculate the coverage of the quantile predictions
+                coverage = exp.calculate_coverage(qhat, setting)
 
             print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
             exp.test(setting, base_dir=args.test_dir)

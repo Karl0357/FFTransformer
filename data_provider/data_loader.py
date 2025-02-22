@@ -226,6 +226,7 @@ class Dataset_wind_data_graph(Dataset):
         # Get the indices for the different stations
         self._stations = {s: i for i, s in enumerate(df_raw.columns.get_level_values(1).unique())}
         self._stations_inv = {v: k for k, v in self._stations.items()}
+
         # Load the static edge features:
         edge_feats = pd.read_csv(os.path.join(self.root_path, 'edge_feats.csv').replace('\\', '/'),
                                  header=[0, 1], index_col=0)

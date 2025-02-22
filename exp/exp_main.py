@@ -8,7 +8,7 @@ from utils.tools import EarlyStopping, adjust_learning_rate, visual, PlotLossesS
 from utils.metrics import metric
 from utils.graph_utils import data_dicts_to_graphs_tuple, split_torch_graph
 from utils.CustomDataParallel import DataParallelGraph
-from layers.Functionality import MultiQuantileLoss
+from layers.Functionality import MultiQuantileLoss, temporal_split
 
 import pickle
 import torch
@@ -83,6 +83,128 @@ class Exp_Main(Exp_Basic):
     def MAPE(self, pred, tar, eps=1e-07):
         loss = torch.mean(torch.abs(pred - tar) / (tar + eps))
         return loss
+    
+    def evaluate_conformal_coverage(self, data, num_trials=100, calib_size=1000, val_size=500):
+        self.model.eval()
+        coverages = []
+        interval_widths = []
+        
+        # Pre-compute predictions for all data
+        with torch.no_grad():
+            all_predictions = []
+            all_true_values = []
+            for batch_x, batch_y, batch_x_mark, batch_y_mark in data:
+                # Prepare inputs and get predictions
+                if self.args.data == 'WindGraph':
+                    batch_x = data_dicts_to_graphs_tuple(batch_x, device=self.device)
+                    batch_y = data_dicts_to_graphs_tuple(batch_y, device=self.device)
+                    dec_inp = batch_y
+                    
+                    batch_x_mark = batch_x_mark.float().to(self.device)
+                    batch_y_mark = batch_y_mark.float().to(self.device)
+                    
+                    # decoder input
+                    dec_zeros = dec_inp.nodes[:, (self.args.label_len - 1):self.args.label_len, :]
+                    dec_zeros = dec_zeros.repeat(1, self.args.pred_len, 1).float()
+                    dec_zeros = torch.cat([dec_inp.nodes[:, :self.args.label_len, :], dec_zeros], dim=1)
+                    dec_zeros = dec_zeros.float().to(self.device)
+                    dec_inp = dec_inp.replace(nodes=dec_zeros)
+                    
+                    dec_inp = dec_inp.replace(nodes=dec_inp.nodes[:, :, -self.args.dec_in:])
+                    batch_x = batch_x.replace(nodes=batch_x.nodes[:, :, -self.args.enc_in:])
+                
+                predictions = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                
+                if self.args.data == 'WindGraph':
+                    batch_y = batch_y.nodes[:, -self.args.pred_len:, -self.args.c_out:].to(self.device)
+                else:
+                    batch_y = batch_y[:, -self.args.pred_len:, -self.args.c_out:].to(self.device)
+                
+                all_predictions.append(predictions.cpu().numpy())
+                all_true_values.append(batch_y.cpu().numpy())
+        
+        all_predictions = np.concatenate(all_predictions, axis=0)
+        all_true_values = np.concatenate(all_true_values, axis=0)
+        
+        for _ in range(num_trials):
+            # Split data into calibration and validation
+            calib_indices, val_indices = self.temporal_split(np.arange(len(all_predictions)), calib_size, val_size)
+            
+            # Calculate qhat using calibration set
+            qhat = self.calculate_qhat(all_predictions[calib_indices], all_true_values[calib_indices])
+            
+            # Evaluate coverage on validation set
+            coverage, interval_width = self.evaluate_coverage(all_predictions[val_indices], all_true_values[val_indices], qhat)
+            coverages.append(coverage)
+            interval_widths.append(interval_width)
+        
+        # Visualize distribution of coverage
+        plt.figure(figsize=(12, 6))
+        
+        # Coverage histogram
+        plt.subplot(1, 2, 1)
+        plt.hist(coverages, bins=20, edgecolor='black', alpha=0.7)
+        plt.axvline(np.mean(coverages), color='r', linestyle='dashed', linewidth=2)
+        plt.title(f'Distribution of Coverage over {num_trials} trials')
+        plt.xlabel('Coverage')
+        plt.ylabel('Frequency')
+        
+        # Add mean and std text
+        mean_coverage = np.mean(coverages)
+        std_coverage = np.std(coverages)
+        plt.text(0.05, 0.95, f'Mean: {mean_coverage:.3f}\nStd: {std_coverage:.3f}', 
+                transform=plt.gca().transAxes, verticalalignment='top')
+        
+        # Normal probability plot
+        plt.subplot(1, 2, 2)
+        sorted_data = np.sort(coverages)
+        norm_quantiles = norm.ppf(np.arange(1, len(coverages) + 1) / (len(coverages) + 1))
+        plt.scatter(norm_quantiles, sorted_data)
+        plt.plot(norm_quantiles, norm_quantiles, color='r', linestyle='--')
+        plt.title('Normal Probability Plot of Coverage')
+        plt.xlabel('Theoretical Quantiles')
+        plt.ylabel('Sample Quantiles')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Print additional metrics
+        target_coverage = 1 - (self.args.quantiles[0] - self.args.quantiles[-1])
+        bias = mean_coverage - target_coverage
+        rmse = np.sqrt(np.mean((np.array(coverages) - target_coverage) ** 2))
+        mean_width = np.mean(interval_widths)
+        
+        print(f"Target Coverage: {target_coverage:.3f}")
+        print(f"Mean Coverage: {mean_coverage:.3f}")
+        print(f"Coverage Std: {std_coverage:.3f}")
+        print(f"Bias: {bias:.3f}")
+        print(f"RMSE: {rmse:.3f}")
+        print(f"Mean Interval Width: {mean_width:.3f}")
+        
+        return mean_coverage, std_coverage
+
+
+    def calculate_qhat(self, predictions, true_values):
+        lower_pred = predictions[:, :, 0]
+        upper_pred = predictions[:, :, -1]
+        
+        scores = np.maximum(true_values - upper_pred, lower_pred - true_values)
+        n = len(scores)
+        alpha = 1 - (self.args.quantiles[0] - self.args.quantiles[-1])
+        qhat = np.quantile(scores, np.ceil((n+1)*(1-alpha))/n)
+        
+        return qhat
+
+    def evaluate_coverage(self, predictions, true_values, qhat):
+        lower_pred = predictions[:, :, 0] - qhat
+        upper_pred = predictions[:, :, -1] + qhat
+        
+        in_interval = (true_values >= lower_pred) & (true_values <= upper_pred)
+        coverage = np.mean(in_interval)
+        
+        interval_width = np.mean(upper_pred - lower_pred)
+        
+        return coverage, interval_width
     
     def calibrate_quantiles(self, setting):
         self.model.eval()
@@ -692,11 +814,10 @@ class Exp_Main(Exp_Basic):
                 if self.args.loss == 'quantile':
                     for q in quantiles:
                         f.write(f'Quantile {q}:\n')
-                        for metric in ['mse', 'mae', 'rmse', 'mape', 'mspe']:
-                            f.write(f'{metric}: {losses[f"{metric}_q{q}"]}\n')
+                        for m in ['mse', 'mae', 'rmse', 'mape', 'mspe']:
+                            f.write(f'{m}: {losses[f"{m}_q{q}"]}\n')
                         f.write('\n')
                 else:
-                    for metric in ['mse', 'mae', 'rmse', 'mape', 'mspe']:
-                        f.write(f'{metric}: {losses[metric + "_sc"]}\n')
-
+                    for m in ['mse', 'mae', 'rmse', 'mape', 'mspe']:
+                        f.write(f'{m}: {losses[m + "_sc"]}\n')
         return losses

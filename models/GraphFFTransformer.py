@@ -18,6 +18,7 @@ class Model(nn.Module):
     def __init__(self, configs):
         super(Model, self).__init__()
         self.num_quantiles = configs.num_quantiles  # New parameter
+        self.c_out = configs.c_out
 
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
@@ -112,5 +113,5 @@ class Model(nn.Module):
             return outputs.nodes[:, -self.pred_len:, :], attns
         else:
             output = outputs.nodes[:, -self.pred_len:, :]
-            return output.view(output.size(0), output.size(1), configs.c_out, configs.num_quantiles) # [B, L, D, Q]
+            return output.view(output.size(0), output.size(1), self.c_out, self.num_quantiles) # [B, L, D, Q]
             #return outputs.nodes[:, -self.pred_len:, :]  # [B, L, D]
